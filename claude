@@ -1,0 +1,59 @@
+#!/bin/zsh
+# ccproxy client shim — portable, machine-agnostic.
+# Installs as ~/.ccproxy/bin/claude and shadows `claude` via PATH.
+# Reads per-machine config from ~/.ccproxy/client.env (BASE_URL + TOKEN),
+# so each machine uses its own pool key.
+#
+# Bypass (direct personal login): aclaude() → ACLAUDE_BYPASS=1.
+# Explicit user env (zai() etc.) always wins over the shim.
+
+# --- locate the real claude binary (any version, survives auto-update) ---
+find_real() {
+  local d="$HOME/.local/share/claude/versions"
+  # newest USABLE version: auto-updater stages the next release as an empty
+  # non-executable placeholder (0 bytes), so require exec bit + size > 1MB
+  # and walk versions newest → oldest instead of trusting the last entry.
+  local v cand
+  for v in $(command ls -1 "$d" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV); do
+    cand="$d/$v"
+    if [[ -x "$cand" ]] && [[ $(stat -f %z "$cand" 2>/dev/null || stat -c %s "$cand" 2>/dev/null || echo 0) -gt 1048576 ]]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  # fallbacks: native-installer symlink, homebrew / npm installs
+  local c
+  for c in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude "$(command -v claude 2>/dev/null)"; do
+    if [[ -x "$c" && "$c" != "$HOME/.ccproxy/bin/claude" ]]; then
+      printf '%s' "$c"; return 0
+    fi
+  done
+  return 1
+}
+
+REAL="$(find_real)" || { echo "ccproxy shim: claude binary not found" >&2; exit 127; }
+# resolve one level of symlink (e.g. homebrew cellar indirection)
+if [[ -L "$REAL" ]]; then
+  L="$(readlink "$REAL")"
+  [[ "$L" = /* ]] && REAL="$L" || REAL="$(dirname "$REAL")/$L"
+fi
+
+if [[ "${ACLAUDE_BYPASS:-0}" == "1" ]]; then
+  exec env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+    -u CLAUDE_CODE_OAUTH_TOKEN "$REAL" "$@"
+fi
+
+# Config: ~/.ccproxy/client.env  (shell fragment: export KEY=value lines)
+CONF="$HOME/.ccproxy/client.env"
+if [[ -f "$CONF" ]]; then
+  source "$CONF"
+fi
+
+# Inject both BASE_URL and the pool key for this machine (client.env).
+# Trade-off: an env auth token disables claude.ai connectors — accepted.
+if [[ -z "${ANTHROPIC_BASE_URL:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+  export ANTHROPIC_BASE_URL="${CCPROXY_URL:-https://cprox.konyaev.me:8787}"
+  export ANTHROPIC_AUTH_TOKEN="${CCPROXY_TOKEN:-}"
+fi
+
+exec "$REAL" "$@"
